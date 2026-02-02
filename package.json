@@ -1,0 +1,25 @@
+{
+  "name": "agent-rps",
+  "version": "1.0.0",
+  "description": "Rock Paper Scissors betting game for AI agents using AgentAuth",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "keywords": [
+    "agent",
+    "game",
+    "rps",
+    "betting",
+    "agentauth",
+    "ai"
+  ],
+  "author": "Klawd <klawdebot@gmail.com>",
+  "license": "MIT",
+  "dependencies": {
+    "@agentauth/core": "file:../agentauth",
+    "better-sqlite3": "^11.7.0",
+    "express": "^4.21.2"
+  }
+}
