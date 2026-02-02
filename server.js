@@ -1,4 +1,5 @@
 const express = require('express');
+const crypto = require('crypto');
 const Database = require('better-sqlite3');
 const { AATToken } = require('@agentauth/core');
 
@@ -13,12 +14,17 @@ db.exec(`
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     player1_did TEXT NOT NULL,
     player2_did TEXT,
+    player1_commitment TEXT NOT NULL,
+    player2_commitment TEXT,
     player1_move TEXT,
     player2_move TEXT,
+    player1_salt TEXT,
+    player2_salt TEXT,
     player1_bet REAL NOT NULL,
     player2_bet REAL,
     winner_did TEXT,
     created_at INTEGER DEFAULT (strftime('%s','now')),
+    committed_at INTEGER,
     completed_at INTEGER
   );
 
@@ -32,13 +38,26 @@ db.exec(`
   );
 `);
 
-// Active games waiting for player 2
+// Active games (commitment phase)
 const activeGames = new Map();
 
-// Create new game
+// Games waiting for reveals
+const committedGames = new Map();
+
+// Helper: Hash commitment
+function hashCommitment(move, salt) {
+  return crypto.createHash('sha256').update(`${move}:${salt}`).digest('hex');
+}
+
+// Helper: Verify commitment
+function verifyCommitment(move, salt, commitment) {
+  return hashCommitment(move, salt) === commitment;
+}
+
+// Create new game (Player 1 commits)
 app.post('/api/game/create', async (req, res) => {
   try {
-    const { token, bet, move } = req.body;
+    const { token, bet, commitment } = req.body;
 
     // Verify AgentAuth token
     const verified = await AATToken.verify(token);
@@ -49,22 +68,22 @@ app.post('/api/game/create', async (req, res) => {
       return res.status(400).json({ error: 'Invalid bet amount' });
     }
 
-    // Validate move
-    if (!['rock', 'paper', 'scissors'].includes(move)) {
-      return res.status(400).json({ error: 'Invalid move' });
+    // Validate commitment
+    if (!commitment || typeof commitment !== 'string' || commitment.length !== 64) {
+      return res.status(400).json({ error: 'Invalid commitment hash' });
     }
 
     // Create game
     const result = db.prepare(`
-      INSERT INTO games (player1_did, player1_move, player1_bet)
+      INSERT INTO games (player1_did, player1_commitment, player1_bet)
       VALUES (?, ?, ?)
-    `).run(playerDID, move, bet);
+    `).run(playerDID, commitment, bet);
 
     const gameId = result.lastInsertRowid;
 
     // Add to active games
     activeGames.set(gameId, {
-      player1: { did: playerDID, move, bet }
+      player1: { did: playerDID, commitment, bet }
     });
 
     res.json({
@@ -79,11 +98,11 @@ app.post('/api/game/create', async (req, res) => {
   }
 });
 
-// Join existing game
+// Join existing game (Player 2 commits)
 app.post('/api/game/:gameId/join', async (req, res) => {
   try {
     const { gameId } = req.params;
-    const { token, move } = req.body;
+    const { token, commitment } = req.body;
 
     // Verify AgentAuth token
     const verified = await AATToken.verify(token);
@@ -92,7 +111,7 @@ app.post('/api/game/:gameId/join', async (req, res) => {
     // Get game
     const game = activeGames.get(parseInt(gameId));
     if (!game) {
-      return res.status(404).json({ error: 'Game not found or already completed' });
+      return res.status(404).json({ error: 'Game not found or already committed' });
     }
 
     // Can't join your own game
@@ -100,53 +119,148 @@ app.post('/api/game/:gameId/join', async (req, res) => {
       return res.status(400).json({ error: 'Cannot join your own game' });
     }
 
+    // Validate commitment
+    if (!commitment || typeof commitment !== 'string' || commitment.length !== 64) {
+      return res.status(400).json({ error: 'Invalid commitment hash' });
+    }
+
+    const bet = game.player1.bet;
+
+    // Update game
+    db.prepare(`
+      UPDATE games
+      SET player2_did = ?, player2_commitment = ?, player2_bet = ?, committed_at = strftime('%s','now')
+      WHERE id = ?
+    `).run(playerDID, commitment, bet, gameId);
+
+    // Move to committed games
+    committedGames.set(parseInt(gameId), {
+      player1: game.player1,
+      player2: { did: playerDID, commitment, bet }
+    });
+    activeGames.delete(parseInt(gameId));
+
+    res.json({
+      gameId,
+      status: 'committed',
+      message: 'Both players committed. Now reveal your moves!'
+    });
+
+  } catch (error) {
+    console.error('Join game error:', error);
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Reveal move (both players must reveal)
+app.post('/api/game/:gameId/reveal', async (req, res) => {
+  try {
+    const { gameId } = req.params;
+    const { token, move, salt } = req.body;
+
+    // Verify AgentAuth token
+    const verified = await AATToken.verify(token);
+    const playerDID = verified.getAgent();
+
     // Validate move
     if (!['rock', 'paper', 'scissors'].includes(move)) {
       return res.status(400).json({ error: 'Invalid move' });
     }
 
-    const bet = game.player1.bet; // Match player 1's bet
-
-    // Update game
-    db.prepare(`
-      UPDATE games
-      SET player2_did = ?, player2_move = ?, player2_bet = ?, completed_at = strftime('%s','now')
-      WHERE id = ?
-    `).run(playerDID, move, bet, gameId);
-
-    // Determine winner
-    const result = determineWinner(game.player1.move, move);
-    let winnerDID = null;
-
-    if (result === 'player1') {
-      winnerDID = game.player1.did;
-    } else if (result === 'player2') {
-      winnerDID = playerDID;
+    // Validate salt
+    if (!salt || typeof salt !== 'string') {
+      return res.status(400).json({ error: 'Invalid salt' });
     }
 
-    // Update winner
-    if (winnerDID) {
-      db.prepare('UPDATE games SET winner_did = ? WHERE id = ?').run(winnerDID, gameId);
+    // Get committed game
+    const game = committedGames.get(parseInt(gameId));
+    if (!game) {
+      return res.status(404).json({ error: 'Game not found or not yet committed' });
     }
 
-    // Update leaderboard
-    updateLeaderboard(game.player1.did, playerDID, winnerDID, bet);
+    // Determine which player
+    const isPlayer1 = game.player1.did === playerDID;
+    const isPlayer2 = game.player2.did === playerDID;
 
-    // Remove from active games
-    activeGames.delete(parseInt(gameId));
+    if (!isPlayer1 && !isPlayer2) {
+      return res.status(403).json({ error: 'You are not a player in this game' });
+    }
 
-    res.json({
-      gameId,
-      status: 'completed',
-      player1: { did: game.player1.did, move: game.player1.move },
-      player2: { did: playerDID, move },
-      winner: winnerDID,
-      pot: bet * 2,
-      result: result === 'draw' ? 'Draw!' : `${winnerDID} wins!`
-    });
+    // Verify commitment
+    const commitment = isPlayer1 ? game.player1.commitment : game.player2.commitment;
+    if (!verifyCommitment(move, salt, commitment)) {
+      return res.status(400).json({ error: 'Move does not match commitment. Cheating detected!' });
+    }
+
+    // Store reveal
+    if (isPlayer1) {
+      game.player1.move = move;
+      game.player1.salt = salt;
+      db.prepare('UPDATE games SET player1_move = ?, player1_salt = ? WHERE id = ?')
+        .run(move, salt, gameId);
+    } else {
+      game.player2.move = move;
+      game.player2.salt = salt;
+      db.prepare('UPDATE games SET player2_move = ?, player2_salt = ? WHERE id = ?')
+        .run(move, salt, gameId);
+    }
+
+    // Check if both revealed
+    if (game.player1.move && game.player2.move) {
+      // Determine winner
+      const result = determineWinner(game.player1.move, game.player2.move);
+      let winnerDID = null;
+
+      if (result === 'player1') {
+        winnerDID = game.player1.did;
+      } else if (result === 'player2') {
+        winnerDID = game.player2.did;
+      }
+
+      // Update winner
+      db.prepare('UPDATE games SET winner_did = ?, completed_at = strftime(\'%s\',\'now\') WHERE id = ?')
+        .run(winnerDID, gameId);
+
+      // Update leaderboard
+      updateLeaderboard(game.player1.did, game.player2.did, winnerDID, game.player1.bet);
+
+      // Remove from committed games
+      committedGames.delete(parseInt(gameId));
+
+      res.json({
+        gameId,
+        status: 'completed',
+        player1: { 
+          did: game.player1.did, 
+          move: game.player1.move,
+          salt: game.player1.salt,
+          commitment: game.player1.commitment
+        },
+        player2: { 
+          did: game.player2.did, 
+          move: game.player2.move,
+          salt: game.player2.salt,
+          commitment: game.player2.commitment
+        },
+        winner: winnerDID,
+        pot: game.player1.bet * 2,
+        result: result === 'draw' ? 'Draw!' : `${winnerDID} wins!`,
+        proof: {
+          verified: true,
+          player1Hash: hashCommitment(game.player1.move, game.player1.salt),
+          player2Hash: hashCommitment(game.player2.move, game.player2.salt)
+        }
+      });
+    } else {
+      res.json({
+        gameId,
+        status: 'revealed',
+        message: `Your move revealed. Waiting for ${isPlayer1 ? 'Player 2' : 'Player 1'} to reveal...`
+      });
+    }
 
   } catch (error) {
-    console.error('Join game error:', error);
+    console.error('Reveal error:', error);
     res.status(400).json({ error: error.message });
   }
 });
@@ -160,6 +274,33 @@ app.get('/api/games/active', (req, res) => {
   }));
 
   res.json({ games });
+});
+
+// Get game status
+app.get('/api/game/:gameId/status', (req, res) => {
+  const { gameId } = req.params;
+  const gid = parseInt(gameId);
+
+  if (activeGames.has(gid)) {
+    res.json({ status: 'waiting', message: 'Waiting for Player 2 to join' });
+  } else if (committedGames.has(gid)) {
+    const game = committedGames.get(gid);
+    const revealed1 = !!game.player1.move;
+    const revealed2 = !!game.player2.move;
+    res.json({ 
+      status: 'committed', 
+      message: 'Both committed. Waiting for reveals...',
+      player1Revealed: revealed1,
+      player2Revealed: revealed2
+    });
+  } else {
+    const dbGame = db.prepare('SELECT * FROM games WHERE id = ?').get(gid);
+    if (dbGame && dbGame.completed_at) {
+      res.json({ status: 'completed', message: 'Game finished' });
+    } else {
+      res.status(404).json({ error: 'Game not found' });
+    }
+  }
 });
 
 // Get leaderboard
@@ -221,4 +362,5 @@ function updateLeaderboard(p1DID, p2DID, winnerDID, bet) {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🎮 Agent RPS running on http://localhost:${PORT}`);
+  console.log(`🔒 Commit-reveal protocol enabled - cryptographically fair!`);
 });

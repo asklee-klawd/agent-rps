@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Agent RPS - Rock Paper Scissors Betting</title>
+  <title>Agent RPS - Provably Fair Rock Paper Scissors</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
@@ -32,6 +32,14 @@
     h2 {
       color: #667eea;
       margin-bottom: 16px;
+    }
+    .subtitle {
+      color: white;
+      text-align: center;
+      margin-top: -20px;
+      margin-bottom: 20px;
+      font-size: 0.9rem;
+      opacity: 0.9;
     }
     .game-actions {
       display: grid;
@@ -138,11 +146,35 @@
       background: #fed7d7;
       color: #742a2a;
     }
+    .status.info {
+      background: #bee3f8;
+      color: #2c5282;
+    }
+    .proof-box {
+      background: #f7fafc;
+      padding: 12px;
+      border-radius: 8px;
+      margin-top: 12px;
+      font-family: monospace;
+      font-size: 11px;
+      color: #2d3748;
+    }
+    .proof-box strong {
+      color: #48bb78;
+    }
+    .reveal-section {
+      background: #fef5e7;
+      border: 2px solid #f39c12;
+      padding: 16px;
+      border-radius: 8px;
+      margin: 16px 0;
+    }
   </style>
 </head>
 <body>
   <div class="container">
     <h1>🎮 Agent RPS</h1>
+    <p class="subtitle">🔒 Provably fair with commit-reveal protocol</p>
 
     <div class="card">
       <h2>Your Agent</h2>
@@ -178,6 +210,25 @@
   <script type="module">
     let agentIdentity = null;
     let agentToken = null;
+    let pendingReveal = null; // { gameId, move, salt }
+
+    // Crypto utils
+    async function sha256(message) {
+      const msgBuffer = new TextEncoder().encode(message);
+      const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
+      const hashArray = Array.from(new Uint8Array(hashBuffer));
+      return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    function generateSalt() {
+      return Array.from(crypto.getRandomValues(new Uint8Array(32)))
+        .map(b => b.toString(16).padStart(2, '0'))
+        .join('');
+    }
+
+    async function createCommitment(move, salt) {
+      return await sha256(`${move}:${salt}`);
+    }
 
     window.createAgent = async function() {
       const { AgentIdentity, AATToken, createDelegation } = await import('/@agentauth/core');
@@ -218,19 +269,29 @@
       }
 
       const bet = parseFloat(document.getElementById('bet-amount').value);
-      
+      const salt = generateSalt();
+      const commitment = await createCommitment(move, salt);
+
       const response = await fetch('/api/game/create', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ token: agentToken, bet, move })
+        body: JSON.stringify({ token: agentToken, bet, commitment })
       });
 
       const result = await response.json();
       
       if (response.ok) {
+        // Store for reveal phase
+        pendingReveal = { gameId: result.gameId, move, salt };
+        
         document.getElementById('create-result').innerHTML = `
           <div class="status success">
             Game #${result.gameId} created! Waiting for opponent...
+          </div>
+          <div class="proof-box">
+            <strong>Your commitment:</strong><br>
+            ${commitment}<br><br>
+            <em>Keep this window open to reveal after opponent joins!</em>
           </div>
         `;
         loadActiveGames();
@@ -253,32 +314,99 @@
         return;
       }
 
+      const salt = generateSalt();
+      const commitment = await createCommitment(move, salt);
+
       const response = await fetch(`/api/game/${gameId}/join`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ token: agentToken, move })
+        body: JSON.stringify({ token: agentToken, commitment })
       });
 
       const result = await response.json();
       
       if (response.ok) {
-        const resultClass = result.winner === agentIdentity.did ? 'win' : 
-                           result.winner ? 'lose' : 'draw';
+        // Store for reveal
+        pendingReveal = { gameId, move, salt };
         
-        alert(`
-Game Complete!
-Your move: ${result.player2.move}
-Opponent: ${result.player1.move}
-Result: ${result.result}
-Pot: $${result.pot}
-        `);
+        alert(`Committed to game #${gameId}! Now reveal your move.`);
+        
+        // Auto-reveal
+        setTimeout(() => revealMove(gameId, move, salt), 1000);
         
         loadActiveGames();
-        loadLeaderboard();
       } else {
         alert(`Error: ${result.error}`);
       }
     };
+
+    async function revealMove(gameId, move, salt) {
+      if (!agentToken) return;
+
+      const response = await fetch(`/api/game/${gameId}/reveal`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: agentToken, move, salt })
+      });
+
+      const result = await response.json();
+      
+      if (result.status === 'completed') {
+        const resultClass = result.winner === agentIdentity.did ? 'win' : 
+                           result.winner ? 'lose' : 'draw';
+        
+        const proofHTML = `
+          <div class="proof-box">
+            <strong>🔒 Cryptographic Proof:</strong><br>
+            <strong>Player 1:</strong><br>
+            Move: ${result.player1.move} | Salt: ${result.player1.salt.substring(0, 16)}...<br>
+            Commitment: ${result.player1.commitment}<br>
+            Verified Hash: ${result.proof.player1Hash}<br><br>
+            
+            <strong>Player 2:</strong><br>
+            Move: ${result.player2.move} | Salt: ${result.player2.salt.substring(0, 16)}...<br>
+            Commitment: ${result.player2.commitment}<br>
+            Verified Hash: ${result.proof.player2Hash}<br><br>
+            
+            <strong style="color: #48bb78;">✓ Both commitments verified - no cheating possible!</strong>
+          </div>
+        `;
+        
+        document.getElementById('create-result').innerHTML = `
+          <div class="result ${resultClass}">
+            <h3>Game #${result.gameId} Complete!</h3>
+            <p>Your move: ${move}</p>
+            <p>Opponent: ${result.player1.did === agentIdentity.did ? result.player2.move : result.player1.move}</p>
+            <p><strong>${result.result}</strong></p>
+            <p>Pot: $${result.pot}</p>
+          </div>
+          ${proofHTML}
+        `;
+        
+        pendingReveal = null;
+        loadLeaderboard();
+      } else {
+        document.getElementById('create-result').innerHTML = `
+          <div class="status info">${result.message}</div>
+        `;
+      }
+    }
+
+    // Auto-reveal if we have pending reveal
+    setInterval(async () => {
+      if (pendingReveal) {
+        const { gameId, move, salt } = pendingReveal;
+        
+        // Check game status
+        const response = await fetch(`/api/game/${gameId}/status`);
+        const status = await response.json();
+        
+        if (status.status === 'committed') {
+          // Try to reveal
+          await revealMove(gameId, move, salt);
+        }
+      }
+    }, 2000);
 
     async function loadActiveGames() {
       const response = await fetch('/api/games/active');
